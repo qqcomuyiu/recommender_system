@@ -9,8 +9,11 @@ import optuna
 from tqdm import tqdm
 import dataop
 import layers
+
+# 强制使用 CPU
 torch.cuda.is_available = lambda: False
 device = torch.device("cpu")
+
 # 加载数据
 items1 = pd.read_csv('C:\\tensor\\item_properties_part1.csv')
 items2 = pd.read_csv('C:\\tensor\\item_properties_part2.csv')
@@ -18,7 +21,7 @@ events = pd.read_csv('C:\\tensor\\events.csv')
 category_tree = pd.read_csv('C:\\tensor\\category_tree.csv')
 
 # 数据预处理
-events = events.head(2000)
+#events = events.head(2000)
 grouped = events.groupby('event')['itemid'].apply(list)
 sequences_tensor = dataop.data_process(grouped)
 sequences_numpy = sequences_tensor.numpy()
@@ -34,46 +37,34 @@ print(f"训练集大小: {X_train.shape}")
 print(f"验证集大小: {X_val.shape}")
 print(f"测试集大小: {X_test.shape}")
 
-# 模型参数设置
+# 输入维度设置
 input_dim = X_train.shape[1]  # 输入维度，等于特征数（列数）
 maxlen = X_train.shape[0]     # 最大序列长度，等于训练集的样本数
-embed_dim = 128  # 嵌入维度
-num_heads = 8  # 注意力头数
-ff_dim = 128  # 前馈网络的隐藏层维度
-num_encoders = 2  # 编码器层数
-num_decoders = 2  # 解码器层数
-num_layers = 2  # 每个编码器/解码器的层数
-dropout = 0.1  # Dropout 概率
-
-# 强制使用 CPU
-device = torch.device("cpu")
-
-# 初始化模型并移动到 CPU
-model = layers.TransformerRecommenderWithMixedAttention(
-    input_dim=input_dim,
-    maxlen=maxlen,
-    embed_dim=embed_dim,
-    num_heads=num_heads,
-    ff_dim=ff_dim,
-    num_encoders=num_encoders,
-    num_decoders=num_decoders,
-    num_layers=num_layers,
-    dropout=dropout,
-).to(device)
-
-# 示例输入张量
-batch_size = 32
-sequence_length = 100  # 假设每个序列长度为100
-dummy_input = torch.randint(0, input_dim, (batch_size, sequence_length)).to(device)  # 强制使用 CPU 上的张量
-
-# 检查模型输出
-dummy_output = model(dummy_input, dummy_input)
-print("模型输出维度:", dummy_output.shape)
-
 
 def objective(trial):
-    # 定义要优化的超参数：学习率
+    # 定义要优化的超参数
     lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
+    num_heads = trial.suggest_categorical("num_heads", [1, 4, 8, 16])
+    ff_dim = trial.suggest_int("ff_dim", 64, 512, step=64)
+    num_encoders = trial.suggest_int("num_encoders", 1, 6)
+    num_decoders = trial.suggest_int("num_decoders", 1, 6)
+    num_layers = trial.suggest_int("num_layers", 1, 4)
+    dropout = trial.suggest_float("dropout", 0.0, 0.5)
+    embed_dim = trial.suggest_int("embed_dim", 64, 256, step=64)
+    #batch_size = trial.suggest_int("batch_size", 16, 128,step = 16)
+    positive_weight = trial.suggest_int("positive_weight", 1, 6)
+    # 初始化模型
+    model = layers.TransformerRecommenderWithMixedAttention(
+        input_dim=input_dim,
+        maxlen=maxlen,
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        ff_dim=ff_dim,
+        num_encoders=num_encoders,
+        num_decoders=num_decoders,
+        num_layers=num_layers,
+        dropout=dropout,
+    ).to(device)
 
     # 使用 AdamW 作为优化器
     optimizer = optim.AdamW(model.parameters(), lr=lr)
@@ -82,12 +73,12 @@ def objective(trial):
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=False)
 
     # 损失函数：加权二元交叉熵损失
-    positive_weight = 2.0  # 正样本权重
+    #positive_weight = 3.0  # 正样本权重
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([positive_weight]).to(device))
 
     # 训练参数
-    epochs = 1
-    batch_size = 32
+    epochs = 50
+    batch_size = 128
     early_stop_patience = 7  # 早停法 patience 设置为 7 个 epoch
     best_val_loss = float('inf')
     early_stop_counter = 0
@@ -95,6 +86,8 @@ def objective(trial):
     for epoch in tqdm(range(epochs), desc="训练进度", leave=False):
         model.train()
         total_loss = 0
+        total_correct = 0  # 累计正确预测的数量
+        total_samples = 0  # 累计样本数量
 
         # 添加进度条到批次循环
         with tqdm(total=len(X_train), desc=f"Epoch {epoch+1}/{epochs}", leave=False) as pbar:
@@ -112,20 +105,36 @@ def objective(trial):
                 optimizer.step()
 
                 total_loss += loss.item() * inputs.size(0)
+
+                # 计算准确率
+                probs = torch.sigmoid(outputs)
+                preds = (probs >= 0.5).float()
+                correct = (preds == targets).sum().item()
+                total_correct += correct
+                total_samples += targets.numel()
+
                 pbar.update(inputs.size(0))  # 更新进度条
 
         avg_train_loss = total_loss / len(X_train)
+        train_accuracy = total_correct / total_samples
 
         # 验证集
         model.eval()
         with torch.no_grad():
             val_inputs = torch.tensor(X_val).to(device)
             val_inputs = torch.clamp(val_inputs, 0, input_dim - 1)
-            val_outputs = model(val_inputs, val_inputs)
             val_targets = (val_inputs > 0).float().to(device)  # 将目标转换为二元
+            val_outputs = model(val_inputs, val_inputs)
             val_loss = criterion(val_outputs, val_targets)
 
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_train_loss:.4f}, Val Loss: {val_loss.item():.4f}")
+            # 计算验证集准确率
+            val_probs = torch.sigmoid(val_outputs)
+            val_preds = (val_probs >= 0.5).float()
+            val_correct = (val_preds == val_targets).sum().item()
+            val_total = val_targets.numel()
+            val_accuracy = val_correct / val_total
+
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_train_loss:.4f}, Accuracy: {train_accuracy:.4f}, Val Loss: {val_loss.item():.4f}, Val Accuracy: {val_accuracy:.4f}")
 
         # 调整学习率
         scheduler.step(val_loss.item())
@@ -143,7 +152,6 @@ def objective(trial):
 
     return best_val_loss
 
-
 # 使用 tqdm 显示优化进度
 n_trials = 5
 with tqdm(total=n_trials, desc="超参数优化进度") as pbar:
@@ -155,5 +163,5 @@ with tqdm(total=n_trials, desc="超参数优化进度") as pbar:
     study = optuna.create_study(direction="minimize")
     study.optimize(wrapped_objective, n_trials=n_trials)
 
-# 打印最佳的学习率
+# 打印最佳的超参数
 print(f"Best trial: {study.best_trial.params}")

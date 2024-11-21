@@ -6,12 +6,19 @@ class DynamicPositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super(DynamicPositionalEncoding, self).__init__()
         self.d_model = d_model
+        self.max_len = max_len
         self.position_encoding = nn.Parameter(torch.zeros(1, max_len, d_model))
 
     def forward(self, x):
         seq_len = x.size(1)
-        pos_encoding = self.position_encoding[:, :seq_len, :]
-        return x + pos_encoding
+        if seq_len > self.max_len:
+            # 动态扩展位置编码矩阵
+            new_position_encoding = torch.zeros(1, seq_len, self.d_model).to(x.device)
+            new_position_encoding[:, :self.max_len, :] = self.position_encoding
+            self.position_encoding = nn.Parameter(new_position_encoding)
+            self.max_len = seq_len
+        return x + self.position_encoding[:, :seq_len, :]
+
 
 class TransformerEncoderLayerWithMixedAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, ff_dim, local_window_size=5, dropout=0.1):
